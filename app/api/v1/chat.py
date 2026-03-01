@@ -18,14 +18,14 @@ from app.services.quota import enforce_daily_quota
 router = APIRouter(tags=["Chat"])
 
 
-VALID_ROLES = ["developer", "system", "user", "assistant"]
+VALID_ROLES = ["developer", "system", "user", "assistant", "tool"]
 USER_CONTENT_TYPES = ["text", "image_url", "input_audio", "file"]
 
 
 class MessageItem(BaseModel):
     """消息项"""
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     
     @field_validator("role")
     @classmethod
@@ -122,7 +122,18 @@ def validate_request(request: ChatCompletionRequest):
     # 验证消息
     for idx, msg in enumerate(request.messages):
         content = msg.content
-        
+        role = msg.role
+
+        # OpenClaw 兼容：assistant/tool 允许 content 为 null。
+        if content is None:
+            if role in ("assistant", "tool"):
+                continue
+            raise ValidationException(
+                message="Message content cannot be empty",
+                param=f"messages.{idx}.content",
+                code="empty_content"
+            )
+
         # 字符串内容
         if isinstance(content, str):
             if not content.strip():

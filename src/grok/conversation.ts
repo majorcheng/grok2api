@@ -4,7 +4,7 @@ import { getModelInfo, toGrokModel } from "./models";
 
 export interface OpenAIChatMessage {
   role: string;
-  content: string | Array<{ type: string; text?: string; image_url?: { url?: string } }>;
+  content: string | Array<{ type: string; text?: string; image_url?: { url?: string } }> | null;
 }
 
 export interface OpenAIChatRequestBody {
