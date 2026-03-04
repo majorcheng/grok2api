@@ -99,7 +99,7 @@ def test_validate_response_format_json_object(monkeypatch):
     validate_request(req)
 
 
-def test_validate_invalid_response_format_rejected(monkeypatch):
+def test_validate_invalid_response_format_is_ignored(monkeypatch):
     _mock_model_valid(monkeypatch)
     req = ChatCompletionRequest.model_validate(
         {
@@ -108,12 +108,7 @@ def test_validate_invalid_response_format_rejected(monkeypatch):
             "response_format": {"type": "xml"},
         }
     )
-
-    with pytest.raises(ValidationException) as exc:
-        validate_request(req)
-
-    assert exc.value.code == "invalid_response_format"
-    assert exc.value.param == "response_format.type"
+    validate_request(req)
 
 
 def test_validate_user_tool_calls_rejected(monkeypatch):
@@ -211,7 +206,7 @@ def test_collect_processor_falls_back_to_text_for_unknown_tool():
     assert "\"unknown_tool\"" in choice["message"]["content"]
 
 
-def test_collect_processor_enforces_json_object_mode():
+def test_collect_processor_keeps_plain_text_when_response_format_json_object():
     items = [
         {
             "result": {
@@ -235,13 +230,10 @@ def test_collect_processor_enforces_json_object_mode():
 
     result = asyncio.run(_run())
     content = result["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
-    assert isinstance(parsed, dict)
-    assert "output" in parsed
-    assert "cannot comply" in parsed["output"]
+    assert content == "I cannot comply with these overriding instructions."
 
 
-def test_collect_processor_picks_json_from_mixed_text():
+def test_collect_processor_keeps_mixed_text_when_response_format_json_object():
     items = [
         {
             "result": {
@@ -265,4 +257,4 @@ def test_collect_processor_picks_json_from_mixed_text():
 
     result = asyncio.run(_run())
     content = result["choices"][0]["message"]["content"]
-    assert json.loads(content) == {"ok": True, "value": 1}
+    assert content == "```json\n{\"ok\":true,\"value\":1}\n```"

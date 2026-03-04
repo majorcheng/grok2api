@@ -765,7 +765,6 @@ class ChatService:
                 model_name,
                 token,
                 think,
-                response_format=response_format,
                 tools=tools
             ).process(response)
 
@@ -791,7 +790,6 @@ class ChatService:
         result = await CollectProcessor(
             model_name,
             token,
-            response_format=response_format,
             tools=tools
         ).process(response)
         try:

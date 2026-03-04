@@ -187,52 +187,6 @@ def extract_tool_calls_from_text(
     return None
 
 
-def normalize_response_format_type(response_format: Any) -> str:
-    if response_format is None:
-        return "text"
-    if isinstance(response_format, str):
-        rf = response_format.strip().lower()
-        return rf if rf in {"text", "json_object", "json_schema"} else "text"
-    if isinstance(response_format, dict):
-        rf = response_format.get("type")
-        if isinstance(rf, str):
-            rf = rf.strip().lower()
-            if rf in {"text", "json_object", "json_schema"}:
-                return rf
-    return "text"
-
-
-def extract_json_value_from_text(text: str, expect_object: bool = False) -> Any:
-    for candidate in _iter_json_candidates(text):
-        payload = _safe_json_loads(candidate)
-        if payload is None:
-            continue
-        if expect_object and not isinstance(payload, dict):
-            continue
-        return payload
-    return None
-
-
-def enforce_json_response_text(text: str, response_format: Any) -> str:
-    """将输出收敛为 JSON 文本，避免返回额外拒绝话术/markdown。"""
-    rf = normalize_response_format_type(response_format)
-    if rf not in {"json_object", "json_schema"}:
-        return text
-
-    raw = (text or "").strip()
-    if rf == "json_object":
-        payload = extract_json_value_from_text(raw, expect_object=True)
-        if payload is None:
-            payload = {"output": raw}
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-    # json_schema: best-effort，不做 schema 校验（避免额外依赖）
-    payload = extract_json_value_from_text(raw, expect_object=False)
-    if payload is None:
-        payload = {"output": raw}
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
 class BaseProcessor:
     """基础处理器"""
     
@@ -324,14 +278,12 @@ class StreamProcessor(BaseProcessor):
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
+        # Grok 上游不支持原生 response_format，参数保留仅为兼容入参，不参与响应改写。
         self.response_format = response_format
-        self.response_format_type = normalize_response_format_type(response_format)
         self.tools = tools or []
         self.enable_tool_calls = bool(self.tools)
-        self.enforce_json_output = self.response_format_type in {"json_object", "json_schema"}
-        self.buffer_final_text = self.enable_tool_calls or self.enforce_json_output
+        self.buffer_final_text = self.enable_tool_calls
         self._buffered_tokens: List[str] = []
-        self._has_media_output: bool = False
         
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -389,7 +341,6 @@ class StreamProcessor(BaseProcessor):
                     
                     # 处理生成的图片
                     for url in mr.get("generatedImageUrls", []):
-                        self._has_media_output = True
                         parts = url.split("/")
                         img_id = parts[-2] if len(parts) >= 2 else "image"
                         
@@ -449,8 +400,6 @@ class StreamProcessor(BaseProcessor):
                     yield self._sse_delta({}, finish="tool_calls")
                 else:
                     final_text = "".join(self._buffered_tokens).strip()
-                    if self.enforce_json_output and not self._has_media_output:
-                        final_text = enforce_json_response_text(final_text, self.response_format)
                     if final_text:
                         yield self._sse(final_text)
                     yield self._sse(finish="stop")
@@ -476,9 +425,8 @@ class CollectProcessor(BaseProcessor):
     ):
         super().__init__(model, token)
         self.image_format = get_config("app.image_format", "url")
+        # Grok 上游不支持原生 response_format，参数保留仅为兼容入参，不参与响应改写。
         self.response_format = response_format
-        self.response_format_type = normalize_response_format_type(response_format)
-        self.enforce_json_output = self.response_format_type in {"json_object", "json_schema"}
         self.tools = tools or []
     
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
@@ -486,7 +434,6 @@ class CollectProcessor(BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
-        has_media_output = False
         
         try:
             async for line in response:
@@ -507,7 +454,6 @@ class CollectProcessor(BaseProcessor):
                     content = mr.get("message", "")
                     
                     if urls := mr.get("generatedImageUrls"):
-                        has_media_output = True
                         content += "\n"
                         for url in urls:
                             parts = url.split("/")
@@ -547,8 +493,6 @@ class CollectProcessor(BaseProcessor):
             finish_reason = "tool_calls"
             message_payload["content"] = None
             message_payload["tool_calls"] = tool_calls
-        elif self.enforce_json_output and not has_media_output:
-            message_payload["content"] = enforce_json_response_text(content, self.response_format)
 
         return {
             "id": response_id,
