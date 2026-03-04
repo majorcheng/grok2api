@@ -21,6 +21,7 @@ router = APIRouter(tags=["Chat"])
 VALID_ROLES = ["developer", "system", "user", "assistant", "tool"]
 USER_CONTENT_TYPES = ["text", "image_url", "input_audio", "file"]
 TOOL_CHOICE_TYPES = ["auto", "none", "required"]
+RESPONSE_FORMAT_TYPES = ["text", "json_object", "json_schema"]
 
 
 class MessageItem(BaseModel):
@@ -103,6 +104,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[MessageItem] = Field(..., description="消息数组")
     stream: Optional[bool] = Field(None, description="是否流式输出")
     thinking: Optional[str] = Field(None, description="思考模式: enabled/disabled/None")
+    response_format: Optional[Union[str, Dict[str, Any]]] = Field(None, description="响应格式约束")
     tools: Optional[List[Dict[str, Any]]] = Field(None, description="工具定义列表")
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None, description="工具选择策略")
     parallel_tool_calls: Optional[bool] = Field(None, description="是否允许并行工具调用")
@@ -235,6 +237,48 @@ def validate_request(request: ChatCompletionRequest):
                 message="tool_choice must be a string or object",
                 param="tool_choice",
                 code="invalid_tool_choice"
+            )
+
+    # 验证 response_format
+    response_format = request.response_format
+    if response_format is not None:
+        if isinstance(response_format, str):
+            rf = response_format.strip().lower()
+            if rf not in RESPONSE_FORMAT_TYPES:
+                raise ValidationException(
+                    message=f"response_format must be one of {RESPONSE_FORMAT_TYPES}",
+                    param="response_format",
+                    code="invalid_response_format"
+                )
+        elif isinstance(response_format, dict):
+            rf_type = response_format.get("type")
+            if not isinstance(rf_type, str) or rf_type not in RESPONSE_FORMAT_TYPES:
+                raise ValidationException(
+                    message=f"response_format.type must be one of {RESPONSE_FORMAT_TYPES}",
+                    param="response_format.type",
+                    code="invalid_response_format"
+                )
+
+            if rf_type == "json_schema":
+                json_schema = response_format.get("json_schema")
+                if not isinstance(json_schema, dict):
+                    raise ValidationException(
+                        message="response_format.json_schema must be an object",
+                        param="response_format.json_schema",
+                        code="invalid_response_format"
+                    )
+                schema = json_schema.get("schema")
+                if schema is not None and not isinstance(schema, dict):
+                    raise ValidationException(
+                        message="response_format.json_schema.schema must be an object",
+                        param="response_format.json_schema.schema",
+                        code="invalid_response_format"
+                    )
+        else:
+            raise ValidationException(
+                message="response_format must be a string or object",
+                param="response_format",
+                code="invalid_response_format"
             )
     
     # 验证消息
@@ -448,6 +492,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             messages=[msg.model_dump() for msg in request.messages],
             stream=request.stream,
             thinking=request.thinking,
+            response_format=request.response_format,
             tools=request.tools,
             tool_choice=request.tool_choice,
             parallel_tool_calls=request.parallel_tool_calls

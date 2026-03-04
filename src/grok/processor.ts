@@ -188,6 +188,54 @@ function extractJsonCandidates(text: string): string[] {
   return deduped;
 }
 
+function normalizeResponseFormatType(responseFormat: unknown): "text" | "json_object" | "json_schema" {
+  if (typeof responseFormat === "string") {
+    const rf = responseFormat.trim().toLowerCase();
+    if (rf === "json_object" || rf === "json_schema" || rf === "text") return rf;
+    return "text";
+  }
+  if (responseFormat && typeof responseFormat === "object") {
+    const rf = (responseFormat as Record<string, unknown>).type;
+    if (typeof rf === "string") {
+      const t = rf.trim().toLowerCase();
+      if (t === "json_object" || t === "json_schema" || t === "text") return t;
+    }
+  }
+  return "text";
+}
+
+function extractJsonValueFromText(text: string, expectObject: boolean): unknown {
+  for (const candidate of extractJsonCandidates(text)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (expectObject && (!payload || typeof payload !== "object" || Array.isArray(payload))) continue;
+    return payload;
+  }
+  return null;
+}
+
+function enforceJsonResponseText(text: string, responseFormat: unknown): string {
+  const rf = normalizeResponseFormatType(responseFormat);
+  if (rf !== "json_object" && rf !== "json_schema") return String(text || "");
+
+  const raw = String(text || "").trim();
+  if (rf === "json_object") {
+    const payload = extractJsonValueFromText(raw, true);
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      return JSON.stringify(payload);
+    }
+    return JSON.stringify({ output: raw });
+  }
+
+  const payload = extractJsonValueFromText(raw, false);
+  if (payload !== null && payload !== undefined) return JSON.stringify(payload);
+  return JSON.stringify({ output: raw });
+}
+
 function normalizeToolCall(item: unknown, allowedNames: Set<string>): Record<string, unknown> | null {
   if (!item || typeof item !== "object") return null;
   const rec = item as Record<string, unknown>;
@@ -254,6 +302,7 @@ export function createOpenAiStreamFromGrokNdjson(
     global: GlobalSettings;
     origin: string;
     requestedModel: string;
+    response_format?: unknown;
     tools?: unknown[];
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
@@ -275,6 +324,9 @@ export function createOpenAiStreamFromGrokNdjson(
     .filter(Boolean);
   const showThinking = settings.show_thinking !== false;
   const enableToolCalls = Array.isArray(opts.tools) && opts.tools.length > 0;
+  const responseFormatType = normalizeResponseFormatType(opts.response_format);
+  const enforceJsonOutput = responseFormatType === "json_object" || responseFormatType === "json_schema";
+  const bufferFinalText = enableToolCalls || enforceJsonOutput;
 
   const firstTimeoutMs = Math.max(0, (settings.stream_first_response_timeout ?? 30) * 1000);
   const chunkTimeoutMs = Math.max(0, (settings.stream_chunk_timeout ?? 120) * 1000);
@@ -302,6 +354,7 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      let hasMediaOutput = false;
       const bufferedTokens: string[] = [];
 
       let buffer = "";
@@ -412,6 +465,7 @@ export function createOpenAiStreamFromGrokNdjson(
               }
 
               if (videoUrl) {
+                hasMediaOutput = true;
                 const videoPath = encodeAssetPath(videoUrl);
                 const src = toImgProxyUrl(global, origin, videoPath);
 
@@ -447,6 +501,7 @@ export function createOpenAiStreamFromGrokNdjson(
               if (modelResp) {
                 const urls = normalizeGeneratedAssetUrls(modelResp.generatedImageUrls);
                 if (urls.length) {
+                  hasMediaOutput = true;
                   const linesOut: string[] = [];
                   for (const u of urls) {
                     const imgPath = encodeAssetPath(u);
@@ -513,16 +568,16 @@ export function createOpenAiStreamFromGrokNdjson(
             }
 
             if (!shouldSkip) {
-              if (enableToolCalls) bufferedTokens.push(content);
+              if (bufferFinalText) bufferedTokens.push(content);
               else controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
             }
             isThinking = currentIsThinking;
           }
         }
 
-        if (enableToolCalls) {
+        if (bufferFinalText) {
           const fullText = bufferedTokens.join("").trim();
-          const toolCalls = extractToolCallsFromText(fullText, opts.tools);
+          const toolCalls = enableToolCalls ? extractToolCallsFromText(fullText, opts.tools) : null;
           if (toolCalls?.length) {
             controller.enqueue(encoder.encode(makeDeltaChunk(id, created, currentModel, { role: "assistant" }, null)));
             toolCalls.forEach((call, index) => {
@@ -568,7 +623,11 @@ export function createOpenAiStreamFromGrokNdjson(
             });
             controller.enqueue(encoder.encode(makeDeltaChunk(id, created, currentModel, {}, "tool_calls")));
           } else {
-            if (fullText) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, fullText)));
+            const finalText =
+              enforceJsonOutput && !hasMediaOutput
+                ? enforceJsonResponseText(fullText, opts.response_format)
+                : fullText;
+            if (finalText) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, finalText)));
             controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
           }
         } else {
@@ -606,6 +665,7 @@ export async function parseOpenAiFromGrokNdjson(
     global: GlobalSettings;
     origin: string;
     requestedModel: string;
+    response_format?: unknown;
     tools?: unknown[];
   },
 ): Promise<Record<string, unknown>> {
@@ -615,6 +675,7 @@ export async function parseOpenAiFromGrokNdjson(
 
   let content = "";
   let model = requestedModel;
+  let hasMediaOutput = false;
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -631,6 +692,7 @@ export async function parseOpenAiFromGrokNdjson(
 
     const videoResp = grok.streamingVideoGenerationResponse;
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
+      hasMediaOutput = true;
       const videoPath = encodeAssetPath(videoResp.videoUrl);
       const src = toImgProxyUrl(global, origin, videoPath);
 
@@ -659,6 +721,7 @@ export async function parseOpenAiFromGrokNdjson(
     const rawUrls = modelResp.generatedImageUrls;
     const urls = normalizeGeneratedAssetUrls(rawUrls);
     if (urls.length) {
+      hasMediaOutput = true;
       for (const u of urls) {
         const imgPath = encodeAssetPath(u);
         const imgUrl = toImgProxyUrl(global, origin, imgPath);
@@ -675,9 +738,11 @@ export async function parseOpenAiFromGrokNdjson(
   }
 
   const toolCalls = extractToolCallsFromText(content, opts.tools);
+  const normalizedContent =
+    !toolCalls && !hasMediaOutput ? enforceJsonResponseText(content, opts.response_format) : content;
   const message = toolCalls
     ? { role: "assistant", content: null, tool_calls: toolCalls }
-    : { role: "assistant", content };
+    : { role: "assistant", content: normalizedContent };
   const finishReason: FinishReason = toolCalls ? "tool_calls" : "stop";
 
   return {

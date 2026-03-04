@@ -40,6 +40,7 @@ class ChatRequest:
     messages: List[Dict[str, Any]]
     stream: bool = None
     think: bool = None
+    response_format: Any = None
     tools: List[Dict[str, Any]] | None = None
     tool_choice: Any = None
     parallel_tool_calls: bool | None = None
@@ -52,6 +53,22 @@ class MessageExtractor:
     UPLOAD_TYPES = {"image_url", "input_audio", "file"}
     # 视频模式不支持的类型
     VIDEO_UNSUPPORTED = {"input_audio", "file"}
+
+    @staticmethod
+    def _normalize_response_format(response_format: Any) -> str:
+        """规范化响应格式标识"""
+        if response_format is None:
+            return "text"
+        if isinstance(response_format, str):
+            rf = response_format.strip().lower()
+            return rf if rf in {"text", "json_object", "json_schema"} else "text"
+        if isinstance(response_format, dict):
+            rf_type = response_format.get("type")
+            if isinstance(rf_type, str):
+                rf_type = rf_type.strip().lower()
+                if rf_type in {"text", "json_object", "json_schema"}:
+                    return rf_type
+        return "text"
 
     @staticmethod
     def _to_json_text(value: Any) -> str:
@@ -151,11 +168,43 @@ class MessageExtractor:
             f"{choice_line}; {parallel_line}\n"
             f"tools={tools_json}"
         )
+
+    @staticmethod
+    def _build_response_format_instruction(response_format: Any = None) -> str:
+        """构造 JSON 输出约束提示"""
+        rf = MessageExtractor._normalize_response_format(response_format)
+        if rf == "json_object":
+            return (
+                "[Response Format Contract]\n"
+                "Return ONLY a valid JSON object.\n"
+                "Do not output markdown, code fences, or additional text."
+            )
+        if rf == "json_schema":
+            schema_text = ""
+            if isinstance(response_format, dict):
+                js = response_format.get("json_schema")
+                if isinstance(js, dict):
+                    schema = js.get("schema")
+                    if isinstance(schema, dict):
+                        try:
+                            schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+                        except Exception:
+                            schema_text = ""
+            base = (
+                "[Response Format Contract]\n"
+                "Return ONLY valid JSON.\n"
+                "Do not output markdown, code fences, or additional text."
+            )
+            if schema_text:
+                return f"{base}\nJSON Schema={schema_text}"
+            return base
+        return ""
     
     @staticmethod
     def extract(
         messages: List[Dict[str, Any]],
         is_video: bool = False,
+        response_format: Any = None,
         tools: List[Dict[str, Any]] | None = None,
         tool_choice: Any = None,
         parallel_tool_calls: bool | None = None
@@ -285,6 +334,10 @@ class MessageExtractor:
         if tool_instruction:
             texts.append(f"system: {tool_instruction}")
 
+        response_format_instruction = MessageExtractor._build_response_format_instruction(response_format)
+        if response_format_instruction:
+            texts.append(f"system: {response_format_instruction}")
+
         # 换行拼接文本
         message = "\n\n".join(texts)
         return message, attachments
@@ -292,6 +345,7 @@ class MessageExtractor:
     @staticmethod
     def extract_text_only(
         messages: List[Dict[str, Any]],
+        response_format: Any = None,
         tools: List[Dict[str, Any]] | None = None,
         tool_choice: Any = None,
         parallel_tool_calls: bool | None = None
@@ -300,6 +354,7 @@ class MessageExtractor:
         text, _ = MessageExtractor.extract(
             messages,
             is_video=True,
+            response_format=response_format,
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls
@@ -563,6 +618,7 @@ class GrokChatService:
             message, attachments = MessageExtractor.extract(
                 request.messages,
                 is_video=is_video,
+                response_format=request.response_format,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls
@@ -615,6 +671,7 @@ class ChatService:
         messages: List[Dict[str, Any]],
         stream: bool = None,
         thinking: str = None,
+        response_format: Any = None,
         tools: List[Dict[str, Any]] | None = None,
         tool_choice: Any = None,
         parallel_tool_calls: bool | None = None
@@ -675,6 +732,7 @@ class ChatService:
             messages=messages,
             stream=is_stream,
             think=think,
+            response_format=response_format,
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls
@@ -707,6 +765,7 @@ class ChatService:
                 model_name,
                 token,
                 think,
+                response_format=response_format,
                 tools=tools
             ).process(response)
 
@@ -732,6 +791,7 @@ class ChatService:
         result = await CollectProcessor(
             model_name,
             token,
+            response_format=response_format,
             tools=tools
         ).process(response)
         try:

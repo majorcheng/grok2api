@@ -31,6 +31,15 @@ export interface OpenAIChatRequestBody {
   model: string;
   messages: OpenAIChatMessage[];
   stream?: boolean;
+  response_format?: "text" | "json_object" | "json_schema" | {
+    type?: string;
+    json_schema?: {
+      name?: string;
+      description?: string;
+      schema?: Record<string, unknown>;
+      strict?: boolean;
+    };
+  };
   tools?: OpenAIToolDefinition[];
   tool_choice?: "auto" | "none" | "required" | { type?: string; function?: { name?: string } };
   parallel_tool_calls?: boolean;
@@ -121,10 +130,61 @@ function buildToolInstruction(args: {
   ].join("\n");
 }
 
+function normalizeResponseFormatType(responseFormat: unknown): "text" | "json_object" | "json_schema" {
+  if (typeof responseFormat === "string") {
+    const rf = responseFormat.trim().toLowerCase();
+    if (rf === "json_object" || rf === "json_schema" || rf === "text") return rf;
+    return "text";
+  }
+  if (responseFormat && typeof responseFormat === "object") {
+    const rf = (responseFormat as Record<string, unknown>).type;
+    if (typeof rf === "string") {
+      const type = rf.trim().toLowerCase();
+      if (type === "json_object" || type === "json_schema" || type === "text") return type;
+    }
+  }
+  return "text";
+}
+
+function buildResponseFormatInstruction(responseFormat: unknown): string {
+  const rf = normalizeResponseFormatType(responseFormat);
+  if (rf === "json_object") {
+    return [
+      "[Response Format Contract]",
+      "Return ONLY a valid JSON object.",
+      "Do not output markdown, code fences, or additional text.",
+    ].join("\n");
+  }
+  if (rf === "json_schema") {
+    let schemaLine = "";
+    if (responseFormat && typeof responseFormat === "object") {
+      const jsonSchema = (responseFormat as Record<string, unknown>).json_schema;
+      if (jsonSchema && typeof jsonSchema === "object") {
+        const schema = (jsonSchema as Record<string, unknown>).schema;
+        if (schema && typeof schema === "object") {
+          try {
+            schemaLine = `JSON Schema=${JSON.stringify(schema)}`;
+          } catch {
+            schemaLine = "";
+          }
+        }
+      }
+    }
+    return [
+      "[Response Format Contract]",
+      "Return ONLY valid JSON.",
+      "Do not output markdown, code fences, or additional text.",
+      ...(schemaLine ? [schemaLine] : []),
+    ].join("\n");
+  }
+  return "";
+}
+
 export function extractContent(
   messages: OpenAIChatMessage[],
   opts?: {
     tools?: OpenAIToolDefinition[];
+    response_format?: OpenAIChatRequestBody["response_format"];
     tool_choice?: OpenAIChatRequestBody["tool_choice"];
     parallel_tool_calls?: boolean;
   },
@@ -202,6 +262,9 @@ export function extractContent(
     ...(opts?.parallel_tool_calls !== undefined ? { parallelToolCalls: opts.parallel_tool_calls } : {}),
   });
   if (toolInstruction) out.push(`system: ${toolInstruction}`);
+
+  const responseFormatInstruction = buildResponseFormatInstruction(opts?.response_format);
+  if (responseFormatInstruction) out.push(`system: ${responseFormatInstruction}`);
 
   return { content: out.join("\n\n"), images };
 }

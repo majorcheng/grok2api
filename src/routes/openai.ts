@@ -1199,6 +1199,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       model?: string;
       messages?: any[];
       stream?: boolean;
+      response_format?: unknown;
       tools?: any[];
       tool_choice?: "auto" | "none" | "required" | { type?: string; function?: { name?: string } };
       parallel_tool_calls?: boolean;
@@ -1269,6 +1270,32 @@ openAiRoutes.post("/chat/completions", async (c) => {
       }
     }
 
+    const responseFormat = body.response_format;
+    if (responseFormat !== undefined && responseFormat !== null) {
+      const allowed = ["text", "json_object", "json_schema"];
+      if (typeof responseFormat === "string") {
+        if (!allowed.includes(responseFormat.trim().toLowerCase())) {
+          return c.json(openAiError("Invalid 'response_format'", "invalid_response_format"), 400);
+        }
+      } else if (typeof responseFormat === "object") {
+        const rfType = typeof (responseFormat as any).type === "string" ? String((responseFormat as any).type).trim().toLowerCase() : "";
+        if (!allowed.includes(rfType)) {
+          return c.json(openAiError("response_format.type is invalid", "invalid_response_format"), 400);
+        }
+        if (rfType === "json_schema") {
+          const jsonSchema = (responseFormat as any).json_schema;
+          if (!jsonSchema || typeof jsonSchema !== "object") {
+            return c.json(openAiError("response_format.json_schema must be an object", "invalid_response_format"), 400);
+          }
+          if (jsonSchema.schema !== undefined && (typeof jsonSchema.schema !== "object" || !jsonSchema.schema)) {
+            return c.json(openAiError("response_format.json_schema.schema must be an object", "invalid_response_format"), 400);
+          }
+        }
+      } else {
+        return c.json(openAiError("'response_format' must be a string or object", "invalid_response_format"), 400);
+      }
+    }
+
     const settingsBundle = await getSettings(c.env);
     const cfg = MODEL_CONFIG[requestedModel]!;
 
@@ -1304,6 +1331,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
       const { content, images } = extractContent(body.messages as any, {
+        ...(responseFormat !== undefined ? { response_format: responseFormat as any } : {}),
         ...(tools.length ? { tools: tools as any } : {}),
         ...(toolChoice !== undefined ? { tool_choice: toolChoice as any } : {}),
         ...(body.parallel_tool_calls !== undefined ? { parallel_tool_calls: body.parallel_tool_calls } : {}),
@@ -1364,6 +1392,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             global: settingsBundle.global,
             origin,
             requestedModel,
+            ...(responseFormat !== undefined ? { response_format: responseFormat as any } : {}),
             tools: tools as any,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
@@ -1396,6 +1425,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
           global: settingsBundle.global,
           origin,
           requestedModel,
+          ...(responseFormat !== undefined ? { response_format: responseFormat as any } : {}),
           tools: tools as any,
         });
 
