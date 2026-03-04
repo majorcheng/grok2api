@@ -5,6 +5,8 @@ import time
 import uuid
 import random
 import html
+import json
+import re
 import orjson
 from typing import Any, AsyncGenerator, Optional, AsyncIterable, List
 
@@ -35,6 +37,154 @@ def _build_video_poster_preview(video_url: str, thumbnail_url: str = "") -> str:
     </span>
   </span>
 </a>'''
+
+
+def _safe_json_loads(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _iter_json_candidates(text: str) -> List[str]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+
+    candidates: List[str] = [stripped]
+
+    fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", stripped, re.IGNORECASE)
+    for block in fenced:
+        block = block.strip()
+        if block:
+            candidates.append(block)
+
+    first_obj = stripped.find("{")
+    last_obj = stripped.rfind("}")
+    if first_obj != -1 and last_obj > first_obj:
+        part = stripped[first_obj:last_obj + 1].strip()
+        if part:
+            candidates.append(part)
+
+    first_arr = stripped.find("[")
+    last_arr = stripped.rfind("]")
+    if first_arr != -1 and last_arr > first_arr:
+        part = stripped[first_arr:last_arr + 1].strip()
+        if part:
+            candidates.append(part)
+
+    # 去重并保持顺序
+    seen = set()
+    deduped: List[str] = []
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _to_arguments_string(value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return "{}"
+        parsed = _safe_json_loads(text)
+        if parsed is not None:
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        return text
+    if value is None:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _extract_tool_names(tools: Optional[List[dict[str, Any]]]) -> set[str]:
+    names = set()
+    if not tools:
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _normalize_tool_call(item: Any, allowed_names: set[str]) -> Optional[dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+
+    fn = item.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        arguments = fn.get("arguments")
+        call_id = item.get("id")
+    else:
+        name = item.get("name")
+        arguments = item.get("arguments")
+        call_id = item.get("id")
+
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    clean_name = name.strip()
+    if allowed_names and clean_name not in allowed_names:
+        return None
+
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = f"call_{uuid.uuid4().hex[:24]}"
+
+    return {
+        "id": call_id.strip(),
+        "type": "function",
+        "function": {
+            "name": clean_name,
+            "arguments": _to_arguments_string(arguments)
+        }
+    }
+
+
+def extract_tool_calls_from_text(
+    text: str,
+    tools: Optional[List[dict[str, Any]]] = None
+) -> Optional[List[dict[str, Any]]]:
+    """从模型文本中识别 OpenAI tool_calls 结构"""
+    allowed_names = _extract_tool_names(tools)
+    if not allowed_names:
+        return None
+
+    for candidate in _iter_json_candidates(text):
+        payload = _safe_json_loads(candidate)
+        if payload is None:
+            continue
+
+        calls: list[Any] = []
+        if isinstance(payload, dict):
+            raw_calls = payload.get("tool_calls")
+            if isinstance(raw_calls, list):
+                calls = raw_calls
+            elif "name" in payload or "function" in payload:
+                calls = [payload]
+        elif isinstance(payload, list):
+            calls = payload
+
+        if not calls:
+            continue
+
+        normalized: List[dict[str, Any]] = []
+        for item in calls:
+            call = _normalize_tool_call(item, allowed_names)
+            if call:
+                normalized.append(call)
+
+        if normalized:
+            return normalized
+
+    return None
 
 
 class BaseProcessor:
@@ -81,21 +231,14 @@ class BaseProcessor:
         if self.app_url:
             return f"{self.app_url.rstrip('/')}{local_path}"
         return local_path
-            
-    def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
-        """构建 SSE 响应 (StreamProcessor 通用)"""
+
+    def _sse_delta(self, delta: dict[str, Any], finish: str = None) -> str:
+        """构建自定义 delta 的 SSE 响应"""
         if not hasattr(self, 'response_id'):
             self.response_id = None
         if not hasattr(self, 'fingerprint'):
             self.fingerprint = ""
-            
-        delta = {}
-        if role:
-            delta["role"] = role
-            delta["content"] = ""
-        elif content:
-            delta["content"] = content
-        
+
         chunk = {
             "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion.chunk",
@@ -105,12 +248,28 @@ class BaseProcessor:
             "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]
         }
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
+            
+    def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
+        """构建 SSE 响应 (StreamProcessor 通用)"""
+        delta = {}
+        if role:
+            delta["role"] = role
+            delta["content"] = ""
+        elif content:
+            delta["content"] = content
+        return self._sse_delta(delta, finish)
 
 
 class StreamProcessor(BaseProcessor):
     """流式响应处理器"""
     
-    def __init__(self, model: str, token: str = "", think: bool = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        think: bool = None,
+        tools: Optional[List[dict[str, Any]]] = None
+    ):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
         self.fingerprint: str = ""
@@ -118,6 +277,9 @@ class StreamProcessor(BaseProcessor):
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
+        self.tools = tools or []
+        self.enable_tool_calls = bool(self.tools)
+        self._buffered_tokens: List[str] = []
         
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -163,8 +325,14 @@ class StreamProcessor(BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     if self.think_opened and self.show_think:
                         if msg := mr.get("message"):
-                            yield self._sse(msg + "\n")
-                        yield self._sse("</think>\n")
+                            if self.enable_tool_calls:
+                                self._buffered_tokens.append(str(msg) + "\n")
+                            else:
+                                yield self._sse(msg + "\n")
+                        if self.enable_tool_calls:
+                            self._buffered_tokens.append("</think>\n")
+                        else:
+                            yield self._sse("</think>\n")
                         self.think_opened = False
                     
                     # 处理生成的图片
@@ -191,11 +359,48 @@ class StreamProcessor(BaseProcessor):
                 # 普通 token
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
-                        yield self._sse(token)
+                        if self.enable_tool_calls:
+                            self._buffered_tokens.append(str(token))
+                        else:
+                            yield self._sse(token)
                         
             if self.think_opened:
-                yield self._sse("</think>\n")
-            yield self._sse(finish="stop")
+                if self.enable_tool_calls:
+                    self._buffered_tokens.append("</think>\n")
+                else:
+                    yield self._sse("</think>\n")
+
+            if self.enable_tool_calls:
+                tool_calls = extract_tool_calls_from_text("".join(self._buffered_tokens).strip(), self.tools)
+                if tool_calls:
+                    for idx, call in enumerate(tool_calls):
+                        yield self._sse_delta({
+                            "tool_calls": [{
+                                "index": idx,
+                                "id": call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": call["function"]["name"],
+                                    "arguments": ""
+                                }
+                            }]
+                        })
+                        yield self._sse_delta({
+                            "tool_calls": [{
+                                "index": idx,
+                                "function": {
+                                    "arguments": call["function"]["arguments"]
+                                }
+                            }]
+                        })
+                    yield self._sse_delta({}, finish="tool_calls")
+                else:
+                    final_text = "".join(self._buffered_tokens).strip()
+                    if final_text:
+                        yield self._sse(final_text)
+                    yield self._sse(finish="stop")
+            else:
+                yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"Stream processing error: {e}", extra={"model": self.model})
@@ -207,9 +412,15 @@ class StreamProcessor(BaseProcessor):
 class CollectProcessor(BaseProcessor):
     """非流式响应处理器"""
     
-    def __init__(self, model: str, token: str = ""):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        tools: Optional[List[dict[str, Any]]] = None
+    ):
         super().__init__(model, token)
         self.image_format = get_config("app.image_format", "url")
+        self.tools = tools or []
     
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集完整响应"""
@@ -260,7 +471,22 @@ class CollectProcessor(BaseProcessor):
             logger.error(f"Collect processing error: {e}", extra={"model": self.model})
         finally:
             await self.close()
-        
+
+        message_content: Optional[str] = content
+        finish_reason = "stop"
+        message_payload: dict[str, Any] = {
+            "role": "assistant",
+            "content": message_content,
+            "refusal": None,
+            "annotations": []
+        }
+
+        tool_calls = extract_tool_calls_from_text(content, self.tools)
+        if tool_calls:
+            finish_reason = "tool_calls"
+            message_payload["content"] = None
+            message_payload["tool_calls"] = tool_calls
+
         return {
             "id": response_id,
             "object": "chat.completion",
@@ -269,8 +495,8 @@ class CollectProcessor(BaseProcessor):
             "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content, "refusal": None, "annotations": []},
-                "finish_reason": "stop"
+                "message": message_payload,
+                "finish_reason": finish_reason
             }],
             "usage": {
                 "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
@@ -587,6 +813,7 @@ class ImageCollectProcessor(BaseProcessor):
 
 
 __all__ = [
+    "extract_tool_calls_from_text",
     "StreamProcessor",
     "CollectProcessor",
     "VideoStreamProcessor",

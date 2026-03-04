@@ -1,6 +1,7 @@
 import type { GrokSettings, GlobalSettings } from "../settings";
 
 type GrokNdjson = Record<string, unknown>;
+type FinishReason = "stop" | "error" | "tool_calls" | null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -22,7 +23,17 @@ function makeChunk(
   created: number,
   model: string,
   content: string,
-  finish_reason?: "stop" | "error" | null,
+  finish_reason?: FinishReason,
+): string {
+  return makeDeltaChunk(id, created, model, content ? { role: "assistant", content } : {}, finish_reason);
+}
+
+function makeDeltaChunk(
+  id: string,
+  created: number,
+  model: string,
+  delta: Record<string, unknown>,
+  finish_reason?: FinishReason,
 ): string {
   const payload: Record<string, unknown> = {
     id,
@@ -32,7 +43,7 @@ function makeChunk(
     choices: [
       {
         index: 0,
-        delta: content ? { role: "assistant", content } : {},
+        delta,
         finish_reason: finish_reason ?? null,
       },
     ],
@@ -114,6 +125,127 @@ function normalizeGeneratedAssetUrls(input: unknown): string[] {
   return out;
 }
 
+function normalizeToolNames(tools?: unknown[]): Set<string> {
+  const names = new Set<string>();
+  if (!Array.isArray(tools)) return names;
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const fn = (tool as Record<string, unknown>).function;
+    if (!fn || typeof fn !== "object") continue;
+    const name = (fn as Record<string, unknown>).name;
+    if (typeof name === "string" && name.trim()) names.add(name.trim());
+  }
+  return names;
+}
+
+function toArgumentsString(value: unknown): string {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return "{}";
+    try {
+      return JSON.stringify(JSON.parse(text));
+    } catch {
+      return text;
+    }
+  }
+  if (value === undefined || value === null) return "{}";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
+}
+
+function extractJsonCandidates(text: string): string[] {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+
+  const out: string[] = [raw];
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/gi) ?? [];
+  for (const block of fenced) {
+    const stripped = block
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+    if (stripped) out.push(stripped);
+  }
+
+  const firstObj = raw.indexOf("{");
+  const lastObj = raw.lastIndexOf("}");
+  if (firstObj >= 0 && lastObj > firstObj) out.push(raw.slice(firstObj, lastObj + 1).trim());
+
+  const firstArr = raw.indexOf("[");
+  const lastArr = raw.lastIndexOf("]");
+  if (firstArr >= 0 && lastArr > firstArr) out.push(raw.slice(firstArr, lastArr + 1).trim());
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const item of out) {
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
+function normalizeToolCall(item: unknown, allowedNames: Set<string>): Record<string, unknown> | null {
+  if (!item || typeof item !== "object") return null;
+  const rec = item as Record<string, unknown>;
+
+  const fnRaw = rec.function;
+  const fn = fnRaw && typeof fnRaw === "object" ? (fnRaw as Record<string, unknown>) : null;
+
+  const nameRaw = fn ? fn.name : rec.name;
+  if (typeof nameRaw !== "string" || !nameRaw.trim()) return null;
+  const name = nameRaw.trim();
+  if (allowedNames.size && !allowedNames.has(name)) return null;
+
+  const argsRaw = fn ? fn.arguments : rec.arguments;
+  const callIdRaw = rec.id;
+  const callId = typeof callIdRaw === "string" && callIdRaw.trim() ? callIdRaw.trim() : `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+
+  return {
+    id: callId,
+    type: "function",
+    function: {
+      name,
+      arguments: toArgumentsString(argsRaw),
+    },
+  };
+}
+
+function extractToolCallsFromText(text: string, tools?: unknown[]): Record<string, unknown>[] | null {
+  const allowedNames = normalizeToolNames(tools);
+  if (!allowedNames.size) return null;
+
+  for (const candidate of extractJsonCandidates(text)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+
+    let calls: unknown[] = [];
+    if (Array.isArray(payload)) {
+      calls = payload;
+    } else if (payload && typeof payload === "object") {
+      const rec = payload as Record<string, unknown>;
+      if (Array.isArray(rec.tool_calls)) calls = rec.tool_calls;
+      else if ("name" in rec || "function" in rec) calls = [rec];
+    }
+    if (!calls.length) continue;
+
+    const normalized: Record<string, unknown>[] = [];
+    for (const item of calls) {
+      const call = normalizeToolCall(item, allowedNames);
+      if (call) normalized.push(call);
+    }
+    if (normalized.length) return normalized;
+  }
+  return null;
+}
+
 export function createOpenAiStreamFromGrokNdjson(
   grokResp: Response,
   opts: {
@@ -122,6 +254,7 @@ export function createOpenAiStreamFromGrokNdjson(
     global: GlobalSettings;
     origin: string;
     requestedModel: string;
+    tools?: unknown[];
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
   },
 ): ReadableStream<Uint8Array> {
@@ -141,6 +274,7 @@ export function createOpenAiStreamFromGrokNdjson(
     .map((t) => t.trim())
     .filter(Boolean);
   const showThinking = settings.show_thinking !== false;
+  const enableToolCalls = Array.isArray(opts.tools) && opts.tools.length > 0;
 
   const firstTimeoutMs = Math.max(0, (settings.stream_first_response_timeout ?? 30) * 1000);
   const chunkTimeoutMs = Math.max(0, (settings.stream_chunk_timeout ?? 120) * 1000);
@@ -168,6 +302,7 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      const bufferedTokens: string[] = [];
 
       let buffer = "";
 
@@ -377,12 +512,68 @@ export function createOpenAiStreamFromGrokNdjson(
               shouldSkip = true;
             }
 
-            if (!shouldSkip) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+            if (!shouldSkip) {
+              if (enableToolCalls) bufferedTokens.push(content);
+              else controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
+            }
             isThinking = currentIsThinking;
           }
         }
 
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
+        if (enableToolCalls) {
+          const fullText = bufferedTokens.join("").trim();
+          const toolCalls = extractToolCallsFromText(fullText, opts.tools);
+          if (toolCalls?.length) {
+            controller.enqueue(encoder.encode(makeDeltaChunk(id, created, currentModel, { role: "assistant" }, null)));
+            toolCalls.forEach((call, index) => {
+              const fn = (call.function ?? {}) as Record<string, unknown>;
+              controller.enqueue(
+                encoder.encode(
+                  makeDeltaChunk(
+                    id,
+                    created,
+                    currentModel,
+                    {
+                      tool_calls: [
+                        {
+                          index,
+                          id: call.id,
+                          type: "function",
+                          function: { name: fn.name, arguments: "" },
+                        },
+                      ],
+                    },
+                    null,
+                  ),
+                ),
+              );
+              controller.enqueue(
+                encoder.encode(
+                  makeDeltaChunk(
+                    id,
+                    created,
+                    currentModel,
+                    {
+                      tool_calls: [
+                        {
+                          index,
+                          function: { arguments: fn.arguments },
+                        },
+                      ],
+                    },
+                    null,
+                  ),
+                ),
+              );
+            });
+            controller.enqueue(encoder.encode(makeDeltaChunk(id, created, currentModel, {}, "tool_calls")));
+          } else {
+            if (fullText) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, fullText)));
+            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
+          }
+        } else {
+          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
+        }
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
         controller.close();
@@ -409,7 +600,14 @@ export function createOpenAiStreamFromGrokNdjson(
 
 export async function parseOpenAiFromGrokNdjson(
   grokResp: Response,
-  opts: { cookie: string; settings: GrokSettings; global: GlobalSettings; origin: string; requestedModel: string },
+  opts: {
+    cookie: string;
+    settings: GrokSettings;
+    global: GlobalSettings;
+    origin: string;
+    requestedModel: string;
+    tools?: unknown[];
+  },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
   const text = await grokResp.text();
@@ -476,6 +674,12 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
+  const toolCalls = extractToolCallsFromText(content, opts.tools);
+  const message = toolCalls
+    ? { role: "assistant", content: null, tool_calls: toolCalls }
+    : { role: "assistant", content };
+  const finishReason: FinishReason = toolCalls ? "tool_calls" : "stop";
+
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,
     object: "chat.completion",
@@ -484,8 +688,8 @@ export async function parseOpenAiFromGrokNdjson(
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
-        finish_reason: "stop",
+        message,
+        finish_reason: finishReason,
       },
     ],
     usage: null,

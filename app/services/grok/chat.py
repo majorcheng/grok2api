@@ -4,6 +4,7 @@ Grok Chat 服务
 
 import asyncio
 import uuid
+import json
 import orjson
 from typing import Dict, List, Any
 from dataclasses import dataclass
@@ -39,6 +40,9 @@ class ChatRequest:
     messages: List[Dict[str, Any]]
     stream: bool = None
     think: bool = None
+    tools: List[Dict[str, Any]] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
 
 
 class MessageExtractor:
@@ -48,9 +52,114 @@ class MessageExtractor:
     UPLOAD_TYPES = {"image_url", "input_audio", "file"}
     # 视频模式不支持的类型
     VIDEO_UNSUPPORTED = {"input_audio", "file"}
+
+    @staticmethod
+    def _to_json_text(value: Any) -> str:
+        """稳定转换为 JSON 文本（用于工具参数/上下文提示）"""
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return "{}"
+            try:
+                parsed = json.loads(text)
+                return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                return text
+        if value is None:
+            return "{}"
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return "{}"
+
+    @staticmethod
+    def _collect_tool_names(tools: List[Dict[str, Any]] | None) -> set[str]:
+        names = set()
+        if not tools:
+            return names
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+        return names
+
+    @staticmethod
+    def _build_tool_instruction(
+        tools: List[Dict[str, Any]] | None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool | None = None
+    ) -> str:
+        """构造工具调用约束提示，帮助上游模型输出可解析的 tool_calls JSON"""
+        if not tools:
+            return ""
+        if isinstance(tool_choice, str) and tool_choice == "none":
+            return ""
+
+        compact_tools = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") != "function":
+                continue
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            compact_tools.append({
+                "type": "function",
+                "function": {
+                    "name": name.strip(),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {"type": "object", "properties": {}})
+                }
+            })
+
+        if not compact_tools:
+            return ""
+
+        choice_line = "tool_choice=auto"
+        if isinstance(tool_choice, str) and tool_choice.strip():
+            choice_line = f"tool_choice={tool_choice.strip()}"
+        elif isinstance(tool_choice, dict):
+            fn = tool_choice.get("function") if isinstance(tool_choice, dict) else None
+            name = fn.get("name") if isinstance(fn, dict) else ""
+            if isinstance(name, str) and name.strip():
+                choice_line = f"tool_choice=function:{name.strip()}"
+
+        parallel_line = "parallel_tool_calls=true"
+        if parallel_tool_calls is False:
+            parallel_line = "parallel_tool_calls=false"
+
+        try:
+            tools_json = json.dumps(compact_tools, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            tools_json = "[]"
+
+        return (
+            "[Tool Calling Contract]\n"
+            "When tool use is needed, output ONLY valid JSON without markdown.\n"
+            "JSON schema: {\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{...}}]}\n"
+            "arguments must be a JSON object.\n"
+            "If no tool is needed, output normal plain text.\n"
+            f"{choice_line}; {parallel_line}\n"
+            f"tools={tools_json}"
+        )
     
     @staticmethod
-    def extract(messages: List[Dict[str, Any]], is_video: bool = False) -> tuple[str, List[str]]:
+    def extract(
+        messages: List[Dict[str, Any]],
+        is_video: bool = False,
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool | None = None
+    ) -> tuple[str, List[str]]:
         """
         从 OpenAI 消息格式提取内容
         
@@ -66,6 +175,7 @@ class MessageExtractor:
         """
         texts = []
         attachments = []  # 需要上传的附件 (URL 或 base64)
+        tool_names = MessageExtractor._collect_tool_names(tools)
 
         # 先抽取每条消息的文本，保留角色信息用于合并
         extracted: List[Dict[str, str]] = []
@@ -119,6 +229,40 @@ class MessageExtractor:
                         if url:
                             attachments.append(("file", url))
 
+            # assistant 历史 tool_calls 上下文
+            msg_tool_calls = msg.get("tool_calls")
+            if role == "assistant" and isinstance(msg_tool_calls, list):
+                for call in msg_tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name", "")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    clean_name = name.strip()
+                    if tool_names and clean_name not in tool_names:
+                        continue
+                    call_id = call.get("id")
+                    call_id = call_id.strip() if isinstance(call_id, str) else ""
+                    args_text = MessageExtractor._to_json_text(fn.get("arguments"))
+                    parts.append(
+                        f"[assistant_tool_call id={call_id or 'generated'} name={clean_name} arguments={args_text}]"
+                    )
+
+            # tool 结果上下文
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                tool_call_id = tool_call_id.strip() if isinstance(tool_call_id, str) else ""
+                tool_result = "\n".join(parts).strip()
+                parts = []
+                if tool_call_id:
+                    if tool_result:
+                        parts.append(f"[tool_result id={tool_call_id}]\n{tool_result}")
+                    else:
+                        parts.append(f"[tool_result id={tool_call_id}]")
+
             if parts:
                 extracted.append({"role": role, "text": "\n".join(parts)})
 
@@ -137,14 +281,29 @@ class MessageExtractor:
             else:
                 texts.append(f"{role}: {text}")
 
+        tool_instruction = MessageExtractor._build_tool_instruction(tools, tool_choice, parallel_tool_calls)
+        if tool_instruction:
+            texts.append(f"system: {tool_instruction}")
+
         # 换行拼接文本
         message = "\n\n".join(texts)
         return message, attachments
     
     @staticmethod
-    def extract_text_only(messages: List[Dict[str, Any]]) -> str:
+    def extract_text_only(
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool | None = None
+    ) -> str:
         """仅提取文本内容"""
-        text, _ = MessageExtractor.extract(messages, is_video=True)
+        text, _ = MessageExtractor.extract(
+            messages,
+            is_video=True,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls
+        )
         return text
 
 
@@ -401,7 +560,13 @@ class GrokChatService:
         
         # 提取消息和附件
         try:
-            message, attachments = MessageExtractor.extract(request.messages, is_video=is_video)
+            message, attachments = MessageExtractor.extract(
+                request.messages,
+                is_video=is_video,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls
+            )
         except ValueError as e:
             raise ValidationException(str(e))
         
@@ -449,7 +614,10 @@ class ChatService:
         model: str,
         messages: List[Dict[str, Any]],
         stream: bool = None,
-        thinking: str = None
+        thinking: str = None,
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool | None = None
     ):
         """
         Chat Completions 入口
@@ -506,7 +674,10 @@ class ChatService:
             model=model,
             messages=messages,
             stream=is_stream,
-            think=think
+            think=think,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls
         )
         
         # 请求 Grok
@@ -532,7 +703,12 @@ class ChatService:
         
         # 处理响应
         if is_stream:
-            processor = StreamProcessor(model_name, token, think).process(response)
+            processor = StreamProcessor(
+                model_name,
+                token,
+                think,
+                tools=tools
+            ).process(response)
 
             async def _wrapped_stream():
                 completed = False
@@ -553,7 +729,11 @@ class ChatService:
 
             return _wrapped_stream()
 
-        result = await CollectProcessor(model_name, token).process(response)
+        result = await CollectProcessor(
+            model_name,
+            token,
+            tools=tools
+        ).process(response)
         try:
             await token_mgr.sync_usage(token, model_name, consume_on_fail=True, is_usage=True)
             await request_stats.record_request(model_name, success=True)

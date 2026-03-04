@@ -20,12 +20,15 @@ router = APIRouter(tags=["Chat"])
 
 VALID_ROLES = ["developer", "system", "user", "assistant", "tool"]
 USER_CONTENT_TYPES = ["text", "image_url", "input_audio", "file"]
+TOOL_CHOICE_TYPES = ["auto", "none", "required"]
 
 
 class MessageItem(BaseModel):
     """消息项"""
     role: str
     content: Optional[Union[str, List[Dict[str, Any]]]] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
     
     @field_validator("role")
     @classmethod
@@ -100,6 +103,9 @@ class ChatCompletionRequest(BaseModel):
     messages: List[MessageItem] = Field(..., description="消息数组")
     stream: Optional[bool] = Field(None, description="是否流式输出")
     thinking: Optional[str] = Field(None, description="思考模式: enabled/disabled/None")
+    tools: Optional[List[Dict[str, Any]]] = Field(None, description="工具定义列表")
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None, description="工具选择策略")
+    parallel_tool_calls: Optional[bool] = Field(None, description="是否允许并行工具调用")
     
     # 视频生成配置
     video_config: Optional[VideoConfig] = Field(None, description="视频生成参数")
@@ -118,11 +124,206 @@ def validate_request(request: ChatCompletionRequest):
             param="model",
             code="model_not_found"
         )
+
+    # 验证 tools
+    tool_names = set()
+    if request.tools is not None:
+        if not isinstance(request.tools, list):
+            raise ValidationException(
+                message="tools must be an array",
+                param="tools",
+                code="invalid_tools"
+            )
+
+        for tool_idx, tool in enumerate(request.tools):
+            if not isinstance(tool, dict):
+                raise ValidationException(
+                    message="Each tool must be an object",
+                    param=f"tools.{tool_idx}",
+                    code="invalid_tools"
+                )
+
+            if tool.get("type") != "function":
+                raise ValidationException(
+                    message="Only function tools are supported",
+                    param=f"tools.{tool_idx}.type",
+                    code="invalid_tools"
+                )
+
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                raise ValidationException(
+                    message="Tool must include function object",
+                    param=f"tools.{tool_idx}.function",
+                    code="invalid_tools"
+                )
+
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValidationException(
+                    message="Tool function name cannot be empty",
+                    param=f"tools.{tool_idx}.function.name",
+                    code="invalid_tools"
+                )
+
+            clean_name = name.strip()
+            if clean_name in tool_names:
+                raise ValidationException(
+                    message=f"Duplicate tool name: {clean_name}",
+                    param=f"tools.{tool_idx}.function.name",
+                    code="invalid_tools"
+                )
+            tool_names.add(clean_name)
+
+            parameters = function.get("parameters")
+            if parameters is not None and not isinstance(parameters, dict):
+                raise ValidationException(
+                    message="Tool function parameters must be an object",
+                    param=f"tools.{tool_idx}.function.parameters",
+                    code="invalid_tools"
+                )
+
+    # 验证 tool_choice
+    tool_choice = request.tool_choice
+    if tool_choice is not None:
+        if isinstance(tool_choice, str):
+            if tool_choice not in TOOL_CHOICE_TYPES:
+                raise ValidationException(
+                    message=f"tool_choice must be one of {TOOL_CHOICE_TYPES}",
+                    param="tool_choice",
+                    code="invalid_tool_choice"
+                )
+        elif isinstance(tool_choice, dict):
+            if tool_choice.get("type") != "function":
+                raise ValidationException(
+                    message="tool_choice.type must be 'function'",
+                    param="tool_choice.type",
+                    code="invalid_tool_choice"
+                )
+
+            function = tool_choice.get("function")
+            if not isinstance(function, dict):
+                raise ValidationException(
+                    message="tool_choice.function must be an object",
+                    param="tool_choice.function",
+                    code="invalid_tool_choice"
+                )
+
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValidationException(
+                    message="tool_choice.function.name cannot be empty",
+                    param="tool_choice.function.name",
+                    code="invalid_tool_choice"
+                )
+
+            if request.tools is None:
+                raise ValidationException(
+                    message="tool_choice requires tools",
+                    param="tool_choice",
+                    code="invalid_tool_choice"
+                )
+
+            if tool_names and name.strip() not in tool_names:
+                raise ValidationException(
+                    message=f"tool_choice function '{name.strip()}' was not found in tools",
+                    param="tool_choice.function.name",
+                    code="invalid_tool_choice"
+                )
+        else:
+            raise ValidationException(
+                message="tool_choice must be a string or object",
+                param="tool_choice",
+                code="invalid_tool_choice"
+            )
     
     # 验证消息
     for idx, msg in enumerate(request.messages):
         content = msg.content
         role = msg.role
+
+        if msg.tool_call_id is not None:
+            if role != "tool":
+                raise ValidationException(
+                    message="tool_call_id is only valid for role=tool",
+                    param=f"messages.{idx}.tool_call_id",
+                    code="invalid_tool_message"
+                )
+            if not isinstance(msg.tool_call_id, str) or not msg.tool_call_id.strip():
+                raise ValidationException(
+                    message="tool_call_id cannot be empty",
+                    param=f"messages.{idx}.tool_call_id",
+                    code="invalid_tool_message"
+                )
+
+        if msg.tool_calls is not None:
+            if role != "assistant":
+                raise ValidationException(
+                    message="tool_calls are only valid for role=assistant",
+                    param=f"messages.{idx}.tool_calls",
+                    code="invalid_tool_message"
+                )
+            if not isinstance(msg.tool_calls, list) or not msg.tool_calls:
+                raise ValidationException(
+                    message="tool_calls must be a non-empty array",
+                    param=f"messages.{idx}.tool_calls",
+                    code="invalid_tool_message"
+                )
+
+            for call_idx, call in enumerate(msg.tool_calls):
+                if not isinstance(call, dict):
+                    raise ValidationException(
+                        message="Each tool_call must be an object",
+                        param=f"messages.{idx}.tool_calls.{call_idx}",
+                        code="invalid_tool_message"
+                    )
+
+                call_type = call.get("type", "function")
+                if call_type != "function":
+                    raise ValidationException(
+                        message="tool_calls only support type='function'",
+                        param=f"messages.{idx}.tool_calls.{call_idx}.type",
+                        code="invalid_tool_message"
+                    )
+
+                call_id = call.get("id", "")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    raise ValidationException(
+                        message="tool_call id cannot be empty",
+                        param=f"messages.{idx}.tool_calls.{call_idx}.id",
+                        code="invalid_tool_message"
+                    )
+
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    raise ValidationException(
+                        message="tool_call.function must be an object",
+                        param=f"messages.{idx}.tool_calls.{call_idx}.function",
+                        code="invalid_tool_message"
+                    )
+
+                name = function.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValidationException(
+                        message="tool_call.function.name cannot be empty",
+                        param=f"messages.{idx}.tool_calls.{call_idx}.function.name",
+                        code="invalid_tool_message"
+                    )
+
+                if tool_names and name.strip() not in tool_names:
+                    raise ValidationException(
+                        message=f"tool_call.function.name '{name.strip()}' was not found in tools",
+                        param=f"messages.{idx}.tool_calls.{call_idx}.function.name",
+                        code="invalid_tool_message"
+                    )
+
+                arguments = function.get("arguments")
+                if arguments is not None and not isinstance(arguments, (str, dict, list, int, float, bool)):
+                    raise ValidationException(
+                        message="tool_call.function.arguments must be string or JSON value",
+                        param=f"messages.{idx}.tool_calls.{call_idx}.function.arguments",
+                        code="invalid_tool_message"
+                    )
 
         # OpenClaw 兼容：assistant/tool 允许 content 为 null。
         if content is None:
@@ -246,7 +447,10 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             model=request.model,
             messages=[msg.model_dump() for msg in request.messages],
             stream=request.stream,
-            thinking=request.thinking
+            thinking=request.thinking,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls
         )
     
     if isinstance(result, dict):

@@ -1199,6 +1199,9 @@ openAiRoutes.post("/chat/completions", async (c) => {
       model?: string;
       messages?: any[];
       stream?: boolean;
+      tools?: any[];
+      tool_choice?: "auto" | "none" | "required" | { type?: string; function?: { name?: string } };
+      parallel_tool_calls?: boolean;
       video_config?: {
         aspect_ratio?: string;
         video_length?: number;
@@ -1212,6 +1215,59 @@ openAiRoutes.post("/chat/completions", async (c) => {
     if (!Array.isArray(body.messages)) return c.json(openAiError("Missing 'messages'", "missing_messages"), 400);
     if (!isValidModel(requestedModel))
       return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+
+    if (body.tools !== undefined && !Array.isArray(body.tools)) {
+      return c.json(openAiError("'tools' must be an array", "invalid_tools"), 400);
+    }
+
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const toolNames = new Set<string>();
+    for (let i = 0; i < tools.length; i++) {
+      const tool = tools[i];
+      if (!tool || typeof tool !== "object") {
+        return c.json(openAiError(`tools[${i}] must be an object`, "invalid_tools"), 400);
+      }
+      if (tool.type !== "function") {
+        return c.json(openAiError(`tools[${i}].type must be 'function'`, "invalid_tools"), 400);
+      }
+      const fn = tool.function;
+      if (!fn || typeof fn !== "object") {
+        return c.json(openAiError(`tools[${i}].function must be an object`, "invalid_tools"), 400);
+      }
+      const name = typeof fn.name === "string" ? fn.name.trim() : "";
+      if (!name) {
+        return c.json(openAiError(`tools[${i}].function.name is required`, "invalid_tools"), 400);
+      }
+      if (toolNames.has(name)) {
+        return c.json(openAiError(`Duplicate tool name: ${name}`, "invalid_tools"), 400);
+      }
+      toolNames.add(name);
+    }
+
+    const toolChoice = body.tool_choice;
+    if (toolChoice !== undefined && toolChoice !== null) {
+      if (typeof toolChoice === "string") {
+        if (!["auto", "none", "required"].includes(toolChoice)) {
+          return c.json(openAiError("Invalid 'tool_choice'", "invalid_tool_choice"), 400);
+        }
+      } else if (typeof toolChoice === "object") {
+        if (toolChoice.type !== "function") {
+          return c.json(openAiError("tool_choice.type must be 'function'", "invalid_tool_choice"), 400);
+        }
+        const forced = typeof toolChoice.function?.name === "string" ? toolChoice.function.name.trim() : "";
+        if (!forced) {
+          return c.json(openAiError("tool_choice.function.name is required", "invalid_tool_choice"), 400);
+        }
+        if (!tools.length) {
+          return c.json(openAiError("tool_choice requires tools", "invalid_tool_choice"), 400);
+        }
+        if (!toolNames.has(forced)) {
+          return c.json(openAiError(`tool_choice function '${forced}' not found in tools`, "invalid_tool_choice"), 400);
+        }
+      } else {
+        return c.json(openAiError("'tool_choice' must be a string or object", "invalid_tool_choice"), 400);
+      }
+    }
 
     const settingsBundle = await getSettings(c.env);
     const cfg = MODEL_CONFIG[requestedModel]!;
@@ -1247,7 +1303,11 @@ openAiRoutes.post("/chat/completions", async (c) => {
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
-      const { content, images } = extractContent(body.messages as any);
+      const { content, images } = extractContent(body.messages as any, {
+        ...(tools.length ? { tools: tools as any } : {}),
+        ...(toolChoice !== undefined ? { tool_choice: toolChoice as any } : {}),
+        ...(body.parallel_tool_calls !== undefined ? { parallel_tool_calls: body.parallel_tool_calls } : {}),
+      });
       const isVideoModel = Boolean(cfg.is_video_model);
       const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
 
@@ -1304,6 +1364,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             global: settingsBundle.global,
             origin,
             requestedModel,
+            tools: tools as any,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
@@ -1335,6 +1396,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
           global: settingsBundle.global,
           origin,
           requestedModel,
+          tools: tools as any,
         });
 
         const duration = (Date.now() - start) / 1000;
